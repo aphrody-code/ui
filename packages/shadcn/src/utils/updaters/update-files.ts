@@ -1,5 +1,4 @@
 import { existsSync, promises as fs, statSync } from "fs"
-import { tmpdir } from "os"
 import path, { basename } from "path"
 import { getRegistryBaseColor } from "@/src/registry/api"
 import { RegistryItem, registryItemFileSchema } from "@/src/schema"
@@ -294,7 +293,13 @@ export async function updateFiles(
   }
 
   const allFiles = [...filesCreated, ...filesUpdated, ...filesSkipped]
-  const updatedFiles = await resolveImports(allFiles, config, plannedFilePaths)
+  const updatedFiles = await resolveImports(
+    allFiles,
+    config,
+    plannedFilePaths,
+    projectInfo,
+    tsConfig
+  )
 
   // Let's update filesUpdated with the updated files.
   filesUpdated.push(...updatedFiles)
@@ -600,13 +605,23 @@ export function resolvePageTarget(
 async function resolveImports(
   filePaths: string[],
   config: Config,
-  plannedFilePaths: string[] = filePaths
+  plannedFilePaths: string[] = filePaths,
+  cachedProjectInfo?: ProjectInfo | null,
+  cachedTsConfig?: ReturnType<typeof loadConfig>
 ) {
   const project = new Project({
     compilerOptions: {},
   })
-  const projectInfo = await getProjectInfo(config.resolvedPaths.cwd)
-  const tsConfig = loadConfig(config.resolvedPaths.cwd)
+  // Reuse pre-computed projectInfo/tsConfig from the caller when available to
+  // avoid redundant fs.glob + tsconfig-paths parse on every call.
+  const projectInfo =
+    cachedProjectInfo !== undefined
+      ? cachedProjectInfo
+      : await getProjectInfo(config.resolvedPaths.cwd)
+  const tsConfig =
+    cachedTsConfig !== undefined
+      ? cachedTsConfig
+      : loadConfig(config.resolvedPaths.cwd)
   const updatedFiles = []
 
   if (!projectInfo || tsConfig.resultType === "failed") {
@@ -623,12 +638,14 @@ async function resolveImports(
 
     const content = await fs.readFile(resolvedPath, "utf-8")
 
-    const dir = await fs.mkdtemp(path.join(tmpdir(), "shadcn-"))
+    // Use an in-memory virtual path instead of mkdtemp — ts-morph does not
+    // write source files to disk; a unique virtual path is sufficient.
     const sourceFile = project.createSourceFile(
-      path.join(dir, basename(resolvedPath)),
+      `/shadcn-virtual/${filepath.replace(/[/\\]/g, "_")}`,
       content,
       {
         scriptKind: ScriptKind.TSX,
+        overwrite: true,
       }
     )
 
@@ -727,10 +744,7 @@ export async function rewriteResolvedImportsInContent({
   const createdSourceFile =
     sourceFile === undefined
       ? project.createSourceFile(
-          path.join(
-            tmpdir(),
-            `shadcn-${Math.random().toString(36).slice(2)}${ext || ".tsx"}`
-          ),
+          `/shadcn-virtual/rewrite-${Math.random().toString(36).slice(2)}${ext || ".tsx"}`,
           content,
           {
             scriptKind: ScriptKind.TSX,

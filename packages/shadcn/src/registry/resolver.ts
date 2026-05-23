@@ -369,81 +369,24 @@ async function resolveDependenciesRecursively(
   options: { useCache?: boolean } = {},
   visited: Set<string> = new Set()
 ) {
-  const items: z.infer<typeof registryItemSchema>[] = []
-  const registryNames: string[] = []
-
-  for (const dep of dependencies) {
-    if (visited.has(dep)) {
-      continue
-    }
+  // Eagerly mark all deps as visited before dispatching in parallel to
+  // prevent concurrent recursive calls from double-fetching the same item.
+  const unvisitedDeps = dependencies.filter((dep) => !visited.has(dep))
+  for (const dep of unvisitedDeps) {
     visited.add(dep)
+  }
 
-    // Handle URLs and local files directly.
-    if (isUrl(dep) || isLocalFile(dep)) {
-      const [item] = await fetchRegistryItems([dep], config, options)
-      if (item) {
-        items.push(item)
-        if (item.registryDependencies) {
-          // Resolve namespaced dependencies to set proper headers.
-          const resolvedDeps = config?.registries
-            ? resolveRegistryItemsFromRegistries(
-                item.registryDependencies,
-                config
-              )
-            : item.registryDependencies
+  const results = await Promise.all(
+    unvisitedDeps.map(async (dep) => {
+      const depItems: z.infer<typeof registryItemSchema>[] = []
+      const depRegistryNames: string[] = []
 
-          const nested = await resolveDependenciesRecursively(
-            resolvedDeps,
-            config,
-            options,
-            visited
-          )
-          items.push(...nested.items)
-          registryNames.push(...nested.registryNames)
-        }
-      }
-    }
-    // Handle namespaced items (e.g., @one/foo, @two/bar).
-    else if (dep.startsWith("@") && config?.registries) {
-      // Check if the registry exists.
-      const { registry } = parseRegistryAndItemFromString(dep)
-      if (registry && !(registry in config.registries)) {
-        throw new RegistryNotConfiguredError(registry)
-      }
-
-      // Let getRegistryItem handle the namespaced item with config
-      // This ensures proper authentication headers are used
-      const [item] = await fetchRegistryItems([dep], config, options)
-      if (item) {
-        items.push(item)
-        if (item.registryDependencies) {
-          // Resolve namespaced dependencies to set proper headers.
-          const resolvedDeps = config?.registries
-            ? resolveRegistryItemsFromRegistries(
-                item.registryDependencies,
-                config
-              )
-            : item.registryDependencies
-
-          const nested = await resolveDependenciesRecursively(
-            resolvedDeps,
-            config,
-            options,
-            visited
-          )
-          items.push(...nested.items)
-          registryNames.push(...nested.registryNames)
-        }
-      }
-    }
-    // Handle regular component names.
-    else {
-      registryNames.push(dep)
-
-      if (config) {
-        try {
-          const [item] = await fetchRegistryItems([dep], config, options)
-          if (item && item.registryDependencies) {
+      // Handle URLs and local files directly.
+      if (isUrl(dep) || isLocalFile(dep)) {
+        const [item] = await fetchRegistryItems([dep], config, options)
+        if (item) {
+          depItems.push(item)
+          if (item.registryDependencies) {
             // Resolve namespaced dependencies to set proper headers.
             const resolvedDeps = config?.registries
               ? resolveRegistryItemsFromRegistries(
@@ -458,15 +401,85 @@ async function resolveDependenciesRecursively(
               options,
               visited
             )
-            items.push(...nested.items)
-            registryNames.push(...nested.registryNames)
+            depItems.push(...nested.items)
+            depRegistryNames.push(...nested.registryNames)
           }
-        } catch (error) {
-          // If we can't fetch the registry item, that's okay - we'll still
-          // include the name.
         }
       }
-    }
+      // Handle namespaced items (e.g., @one/foo, @two/bar).
+      else if (dep.startsWith("@") && config?.registries) {
+        // Check if the registry exists.
+        const { registry } = parseRegistryAndItemFromString(dep)
+        if (registry && !(registry in config.registries)) {
+          throw new RegistryNotConfiguredError(registry)
+        }
+
+        // Let getRegistryItem handle the namespaced item with config
+        // This ensures proper authentication headers are used
+        const [item] = await fetchRegistryItems([dep], config, options)
+        if (item) {
+          depItems.push(item)
+          if (item.registryDependencies) {
+            // Resolve namespaced dependencies to set proper headers.
+            const resolvedDeps = config?.registries
+              ? resolveRegistryItemsFromRegistries(
+                  item.registryDependencies,
+                  config
+                )
+              : item.registryDependencies
+
+            const nested = await resolveDependenciesRecursively(
+              resolvedDeps,
+              config,
+              options,
+              visited
+            )
+            depItems.push(...nested.items)
+            depRegistryNames.push(...nested.registryNames)
+          }
+        }
+      }
+      // Handle regular component names.
+      else {
+        depRegistryNames.push(dep)
+
+        if (config) {
+          try {
+            const [item] = await fetchRegistryItems([dep], config, options)
+            if (item && item.registryDependencies) {
+              // Resolve namespaced dependencies to set proper headers.
+              const resolvedDeps = config?.registries
+                ? resolveRegistryItemsFromRegistries(
+                    item.registryDependencies,
+                    config
+                  )
+                : item.registryDependencies
+
+              const nested = await resolveDependenciesRecursively(
+                resolvedDeps,
+                config,
+                options,
+                visited
+              )
+              depItems.push(...nested.items)
+              depRegistryNames.push(...nested.registryNames)
+            }
+          } catch {
+            // If we can't fetch the registry item, that's okay - we'll still
+            // include the name.
+          }
+        }
+      }
+
+      return { items: depItems, registryNames: depRegistryNames }
+    })
+  )
+
+  const items: z.infer<typeof registryItemSchema>[] = []
+  const registryNames: string[] = []
+  for (const r of results) {
+    items.push(...r.items)
+    registryNames.push(...r.registryNames)
   }
 
   return { items, registryNames }
